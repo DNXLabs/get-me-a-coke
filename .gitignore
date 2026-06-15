@@ -1,0 +1,29 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# CDK
+infra/.venv/
+infra/cdk.out/
+cdk.out/
+
+# Tooling / local artifacts
+graphify-out/
+.claude/settings.local.json
+
+# OS
+.DS_Store

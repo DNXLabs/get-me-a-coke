@@ -1,0 +1,9 @@
+{
+  "app": "python app.py",
+  "context": {
+    "env": "dev",
+    "project": "get-me-a-coke",
+    "region": "ap-southeast-2",
+    "account": "REPLACE_WITH_YOUR_AWS_ACCOUNT_ID"
+  }
+}
