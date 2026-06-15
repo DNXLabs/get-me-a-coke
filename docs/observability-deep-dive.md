@@ -1438,233 +1438,335 @@ You should see:
 ## Real-World Example: Get Me a Coke
 
 The **get-me-a-coke** project demonstrates production-grade AI observability for a Strands agent on AWS, including:
-- OpenInference instrumentation for LLM and tool tracing
-- Human-in-the-loop approval gates for purchases
-- Audit logging for compliance
-- Dual export to CloudWatch and Grafana Cloud
+- OpenInference instrumentation for LLM and tool tracing (transformed via a span processor)
+- A second AI-native layer via the **Grafana Sigil** SDK (client + Strands hooks + a tool-execution decorator)
+- A **Step Functions**-backed human-in-the-loop approval gate for purchases
+- Audit logging for compliance, correlated by `trace_id`
+
+> **Note on accuracy.** The earlier sections of this document are conceptual and use illustrative
+> snippets. This section is reconciled against the actual source in
+> [`src/observability/`](../src/observability/) and [`src/agent/`](../src/agent/) — the code blocks
+> below mirror what the repository really does (model: `nvidia.nemotron-nano-3-30b`).
 
 ### Architecture
 
 ```
-User → AgentCore Runtime (Strands Agent)
-           ↓
-       System Prompt (HITL requirement) → Audit Logs
-           ↓
-       [Tools: list_products, get_purchase_quote, execute_purchase, wallet_pay]
-           ↓
-       HITL Gate: execute_purchase refuses without prior quote
-           ↓
-       [OpenInference Instrumentation]
-           ↓
-       [Dual Export: CloudWatch + Grafana Cloud]
+AI Engineer ── prompt ──▶ Agent CLI (Strands Agent + Bedrock)
+                              │  tools: list_products · get_purchase_quote ·
+                              │         execute_purchase · wallet_get_balance · wallet_pay
+                              ▼
+                  execute_purchase → Step Functions Activity (HITL gate)
+                              │            └─ human approve / reject (blocks)
+                              ▼ on approval
+                  Wallet Service (USDC pay) ──▶ x402 payment proof
+                              ▼
+                  Vending Machine (X-PAYMENT) ──▶ dispense product
+
+  Observability (every step):
+    OpenInference spans ── OTLP ──▶ Grafana Cloud (Tempo / Mimir / Loki)
+    Sigil generations + tool executions ──────▶ Grafana AI Observability
+    (On AgentCore Runtime, built-in ADOT also exports to CloudWatch.)
 ```
 
 **Key features**:
-- Two-step purchase flow with mandatory human approval
-- Tool-level enforcement (not just prompt-based)
-- Every purchase logged with user_id, timestamp, context
-- Observability proves HITL compliance
+- Quote-then-purchase flow where `execute_purchase` triggers a Step Functions approval workflow
+- The approval gate is a hard system-level control (a human is prompted; the agent cannot bypass it)
+- A `_pending_quote` guard rejects `execute_purchase` calls with no matching prior quote
+- Every purchase logged with `user_id`, timestamp, and the Step Functions execution context
+- Two observability layers: OpenInference→OTLP **and** Sigil, both fail-safe
 
 ### Key Implementation Details
 
 #### 1. Telemetry Configuration
 
-From `src/observability/telemetry.py`:
+From `src/observability/telemetry.py`. The real entry point is `configure_telemetry(config=...)`,
+which accepts the full `AgentConfig` and decides what to set up based on which credentials are
+present (see [Coexistence Scenarios](#coexistence-scenarios) below). The OTLP-export path looks like
+this:
 
 ```python
 def configure_telemetry(
-    grafana_otlp_endpoint: str,
-    grafana_instance_id: str,
-    grafana_api_token: str,
-    service_name: str = "get-me-a-coke-agent"
-):
-    # Enable latest GenAI semantic conventions
-    os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = (
-        "gen_ai_latest_experimental,"
-        "gen_ai_tool_definitions,"
-        "gen_ai_use_latest_invocation_tokens"
-    )
-    
+    grafana_otlp_endpoint: str = "",
+    grafana_instance_id: str = "",
+    grafana_api_token: str = "",
+    service_name: str = "get-me-a-coke-agent",
+    config: AgentConfig | None = None,
+) -> None:
+    # ... (resolve creds from `config`, detect OTEL_* env vars, decide has_otlp / has_sigil) ...
+
+    # Opt into the latest GenAI semantic conventions for richer span content
+    # (merged with any existing OTEL_SEMCONV_STABILITY_OPT_IN, not overwritten):
+    #   gen_ai_latest_experimental,
+    #   gen_ai_tool_definitions,
+    #   gen_ai_use_latest_invocation_tokens
+
     resource = Resource.create({
         "service.name": service_name,
         "service.version": "0.1.0",
         "deployment.environment": "dev",
         "ai.model.id": "nvidia.nemotron-nano-3-30b",
-        "ai.model.provider": "aws.bedrock"
+        "ai.model.provider": "aws.bedrock",
     })
-    
+
     provider = TracerProvider(resource=resource)
-    
-    # OpenInference processor FIRST
-    provider.add_span_processor(StrandsAgentsToOpenInferenceProcessor())
-    
-    # Grafana OTLP export SECOND
-    headers = build_grafana_auth_headers(grafana_instance_id, grafana_api_token)
-    exporter = OTLPSpanExporter(
-        endpoint=f"{grafana_otlp_endpoint}/v1/traces",
-        headers=headers
-    )
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    
-    trace.set_tracer_provider(provider)
+
+    if has_otlp:
+        # OpenInference processor FIRST — transforms raw Strands spans
+        provider.add_span_processor(StrandsAgentsToOpenInferenceProcessor())
+
+        # Grafana OTLP export SECOND. Endpoint + Basic-auth headers are built by
+        # observability.exporters.build_otlp_endpoint() / build_grafana_auth_headers(),
+        # or taken straight from OTEL_EXPORTER_OTLP_* env vars when those are set.
+        headers = build_grafana_auth_headers(grafana_instance_id, grafana_api_token)
+        endpoint = build_otlp_endpoint(grafana_otlp_endpoint, "traces")  # → .../v1/traces
+        provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, headers=headers))
+        )
+
+    trace.set_tracer_provider(provider)  # set for BOTH otlp and sigil-only scenarios
+
+    # Logs (Loki) + metrics (Mimir) configured similarly, then httpx is instrumented,
+    # and finally the Sigil client is initialized (see below).
+    if config is not None:
+        _initialize_sigil_client(config)
 ```
 
 **Why this ordering matters**: The OpenInference processor transforms raw Strands spans into OpenInference-compliant spans. If the OTLP exporter runs first, Grafana receives raw spans without AI semantic conventions.
 
+**Why the `TracerProvider` is set even without OTLP**: the Sigil SDK emits its *own* internal OTel spans and metrics, so a `TracerProvider`/`MeterProvider` must be globally set before the Sigil client is created — even in the Sigil-only scenario where nothing is exported via OTLP.
+
 #### 2. Agent Instrumentation
 
-From `src/agent/agent.py`:
+From `src/agent/agent.py`. The real agent exposes **five** tools and, when a Sigil client is
+available, attaches a Sigil Strands hook provider so generations are captured as the agent reasons:
 
 ```python
 from strands import Agent
 from strands.models.bedrock import BedrockModel
 
+from agent.tools.approval import execute_purchase
+from agent.tools.vending_machine import get_purchase_quote, list_products
+from agent.tools.wallet import wallet_get_balance, wallet_pay
+from observability.telemetry import get_sigil_client
+
 def create_agent(config: AgentConfig) -> Agent:
     model = BedrockModel(
-        model_id=config.bedrock_model_id,  # nvidia.nemotron-nano-3-30b
-        region_name=config.aws_region
+        model_id=config.bedrock_model_id,   # nvidia.nemotron-nano-3-30b
+        region_name=config.aws_region,
     )
-    
+
+    # Attach the Sigil Strands adapter for AI observability — only if a client exists.
+    sigil_hooks = []
+    sigil_client = get_sigil_client()
+    if sigil_client is not None:
+        try:
+            from sigil_sdk_strands import SigilStrandsHandler, SigilStrandsHookProvider
+
+            handler = SigilStrandsHandler(
+                client=sigil_client, agent_name="nova", agent_version="0.1.0",
+            )
+            sigil_hooks.append(SigilStrandsHookProvider(sigil_handler=handler))
+        except ImportError:
+            logger.warning("sigil-sdk-strands not installed. Continuing without Sigil adapter.")
+        except Exception as e:
+            logger.warning("Failed to create Sigil Strands adapter: %s", e)
+
     return Agent(
         model=model,
-        system_prompt=get_system_prompt(config),
-        tools=[list_products, get_purchase_quote, execute_purchase, wallet_get_balance]
+        system_prompt=get_system_prompt(config),  # Bedrock Prompt Management, fallback to default
+        tools=[list_products, get_purchase_quote, execute_purchase,
+               wallet_get_balance, wallet_pay],
+        hooks=sigil_hooks or None,
     )
 ```
 
-**No explicit instrumentation code** — Strands SDK emits OTel spans automatically, and the OpenInference processor handles transformation.
+**Tracing needs no explicit code** — Strands emits OTel spans automatically and the OpenInference
+processor transforms them. The only manual wiring is the **Sigil** layer: the hook provider above,
+plus the tool-execution decorator described next. Both are guarded so a missing/failed Sigil SDK
+never affects the agent.
+
+#### 2b. Sigil Tool-Execution Wrapper
+
+`src/observability/sigil_tools.py` provides a `@sigil_tool_wrapper` decorator that records each tool
+call to Sigil with `tool_name`, `input_args`, `output`, `duration_ms`, and `success`. It is applied to
+high-stakes tools (e.g. `execute_purchase`). The recording is entirely best-effort:
+
+```python
+def sigil_tool_wrapper(tool_fn):
+    @functools.wraps(tool_fn)
+    def wrapper(*args, **kwargs):
+        client = get_sigil_client()
+        if client is None:
+            return tool_fn(*args, **kwargs)        # no Sigil → plain passthrough
+
+        start = time.time()
+        try:
+            result = tool_fn(*args, **kwargs)
+            try:
+                client.start_tool_execution(
+                    tool_name=tool_fn.__name__, input_args=..., output=result,
+                    duration_ms=(time.time() - start) * 1000, success=True,
+                )
+            except Exception as rec_err:                 # recording failure is swallowed
+                logger.warning("Sigil tool recording failed for %s: %s", tool_fn.__name__, rec_err)
+            return result
+        except Exception as e:
+            # record success=False with the exception text, then RE-RAISE the original error
+            ...
+            raise
+    return wrapper
+```
+
+**Key property**: Sigil instrumentation is observational only. A Sigil outage cannot fail a tool, and
+a tool exception is still propagated to the agent unchanged.
+
+#### 2c. Sigil Client Initialization
+
+`_initialize_sigil_client()` (in `telemetry.py`) builds the client from `AgentConfig`, but only when
+**all** required credentials are present. Partial credentials log a warning and skip; a missing
+`sigil-sdk` package is tolerated. The auth mode determines how the token is used:
+
+```python
+from sigil_sdk import Client as SigilClient, ClientConfig
+from sigil_sdk.config import AuthConfig, GenerationExportConfig
+
+auth_kwargs = {"mode": config.sigil_auth_mode, "tenant_id": config.sigil_auth_tenant_id}
+if config.sigil_auth_mode == "basic":
+    auth_kwargs["basic_password"] = config.sigil_auth_token
+else:
+    auth_kwargs["bearer_token"] = config.sigil_auth_token
+
+client_config = ClientConfig(
+    generation_export=GenerationExportConfig(
+        endpoint=config.sigil_endpoint,
+        protocol=config.sigil_protocol,        # "http" | "grpc" | "none"
+        auth=AuthConfig(**auth_kwargs),
+    ),
+)
+sigil_client = SigilClient(config=client_config)
+```
+
+This runs **after** the `TracerProvider`/`MeterProvider` are set globally, and is exposed to the rest
+of the app through `get_sigil_client()` (returns `None` when Sigil is not configured).
 
 #### 3. Distributed Tracing Across Services
 
-The agent calls external APIs (vending machine, wallet service). To propagate trace context:
+The agent calls external APIs (vending machine, wallet service) over **synchronous** `httpx`.
+`configure_telemetry()` instruments the httpx client once (`_instrument_httpx()`), so every outbound
+call carries the W3C `traceparent` header automatically — no per-call code:
 
 ```python
-# Instrument httpx for automatic trace propagation
+# src/observability/telemetry.py — _instrument_httpx()
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 HTTPXClientInstrumentor().instrument()
 
-# Now all httpx calls automatically send W3C traceparent header
+# Thereafter, ordinary sync calls propagate trace context, e.g. in approval.py:
 import httpx
-async with httpx.AsyncClient() as client:
-    response = await client.post(
-        "https://vending-machine.example.com/purchase/coke"
-    )
-    # Trace context propagated automatically
+pay_resp = httpx.post(f"{_wallet_url()}/pay", headers=_wallet_headers(), json={...}, timeout=10)
+resp = httpx.post(f"{_vending_machine_url()}/purchase/{product_id}",
+                  headers={"X-PAYMENT": payment_proof}, timeout=10)
 ```
 
-The vending machine API (FastAPI) also instruments with OpenTelemetry:
+The FastAPI services (wallet, vending machine) are instrumented through a shared helper,
+`src/observability/fastapi_telemetry.py`, which is itself import-tolerant (skips with a warning if
+`opentelemetry-instrumentation-fastapi` is absent):
 
 ```python
-# src/vending_machine/app.py
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+# src/observability/fastapi_telemetry.py
+def instrument_fastapi_app(app, service_name: str) -> None:
+    ...
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    FastAPIInstrumentor.instrument_app(app)
 
-app = FastAPI()
-FastAPIInstrumentor.instrument_app(app)
-
-@app.post("/purchase/{product_id}")
-async def purchase(product_id: str):
-    # This span is automatically linked to parent agent span
-    return {"status": "dispensed"}
+# src/vending_machine/app.py and src/wallet_service/app.py
+from observability.fastapi_telemetry import instrument_fastapi_app
+instrument_fastapi_app(app, service_name="vending-machine")  # / "wallet-service"
 ```
 
-Result: **End-to-end trace** from user query → agent reasoning → tool execution → API call → response.
+Result: **End-to-end trace** from agent reasoning → `execute_purchase` → wallet `/pay` → vending
+`/purchase/{id}`, all stitched into one trace in Tempo via the propagated context.
 
-#### 5. Human-in-the-Loop Approval Gate
+#### 4. Human-in-the-Loop Approval Gate
 
-The project demonstrates **conversational approval + tool-level enforcement**:
+The project enforces approval in **two independent layers**: a quote guard in the tool, and a
+**Step Functions** approval workflow that blocks on a real human decision. The agent itself cannot
+approve — the gate is a system-level control.
 
-**System prompt enforces two-step flow**:
+**System prompt** (from `src/agent/agent.py`) describes the flow and makes clear the gate is enforced
+by the system, not by the model asking politely:
+
 ```python
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = """\
+You are a vending machine purchasing agent with a crypto wallet.
+...
 PURCHASE FLOW (mandatory):
 1. Use list_products to show what's available
 2. Use get_purchase_quote to get the price
-3. Show the quote to the user and ASK for explicit approval
-4. ONLY if the user says yes/approve/confirm, call execute_purchase
-5. If the user says no/cancel/decline, do NOT call execute_purchase
+3. Show the quote to the user
+4. Call execute_purchase — this triggers a Step Functions approval workflow that prompts the
+   human for explicit approval. You do NOT need to ask for approval yourself; the system enforces it.
+5. Report the result (approved and purchased, or rejected)
 
-NEVER call execute_purchase without showing the quote and getting user approval first.
-This is an audited action — every purchase is logged with user identity and timestamp.
+IMPORTANT:
+- The approval gate is a hard system-level control. The human will be prompted automatically.
+- Every purchase is audited with user identity, timestamp, and Step Functions execution ID.
 """
 ```
 
-**Tool-level enforcement** (from `src/agent/tools/vending_machine.py`):
+**Tool-level enforcement** (from `src/agent/tools/approval.py`). The quote guard uses a module-level
+`_pending_quote` (set by `get_purchase_quote` in `vending_machine.py`); the actual approval is a
+Step Functions Activity that blocks until a human responds via the task token:
 
 ```python
-# Tool state tracking (simplified)
-conversation_state = {}
-
-def get_purchase_quote(product_id: str) -> dict:
-    """Get quote for product (step 1 of HITL flow)."""
-    quote = fetch_quote(product_id)
-    
-    # Store quote in conversation state
-    conversation_state["last_quote"] = {
-        "product_id": product_id,
-        "price": quote["price"],
-        "timestamp": datetime.utcnow()
-    }
-    
-    with tracer.start_as_current_span("tool.get_purchase_quote") as span:
-        span.set_attribute("tool.name", "get_purchase_quote")
-        span.set_attribute("hitl.quote_provided", True)
-    
-    return quote
-
+@tool
+@sigil_tool_wrapper                       # ← Sigil records this tool execution
 def execute_purchase(product_id: str) -> dict:
-    """Execute purchase ONLY if quote was previously shown (HITL gate)."""
-    
-    with tracer.start_as_current_span("tool.execute_purchase") as span:
-        span.set_attribute("tool.name", "execute_purchase")
-        span.set_attribute("hitl.gate_enforced", True)
-        
-        # Check if quote exists
-        last_quote = conversation_state.get("last_quote")
-        
-        if not last_quote or last_quote["product_id"] != product_id:
-            span.set_attribute("hitl.gate_passed", False)
-            raise PermissionError("Cannot purchase without showing quote first")
-        
-        # Check quote age (expire after 5 minutes)
-        if datetime.utcnow() - last_quote["timestamp"] > timedelta(minutes=5):
-            span.set_attribute("hitl.gate_passed", False)
-            raise PermissionError("Quote expired, please request new quote")
-        
-        span.set_attribute("hitl.gate_passed", True)
-        
-        # Execute purchase
-        result = perform_purchase(product_id, last_quote["price"])
-        
-        # Audit log
-        logger.info(
-            "Purchase executed with HITL approval",
-            extra={
-                "product_id": product_id,
-                "price": last_quote["price"],
-                "user_id": get_current_user(),
-                "trace_id": hex(span.get_span_context().trace_id)
-            }
-        )
-        
-        return result
+    """Buy a product. Triggers a human approval gate before completing."""
+    from agent.tools.vending_machine import _pending_quote
+
+    # Guard: a matching quote must exist first
+    if _pending_quote is None:
+        return {"success": False, "error": "No pending quote. Call get_purchase_quote first."}
+    if _pending_quote["product_id"] != product_id:
+        return {"success": False,
+                "error": f"Quote is for '{_pending_quote['product_id']}', not '{product_id}'."}
+
+    sfn = _sfn_client()
+    exec_resp = sfn.start_execution(stateMachineArn=_state_machine_arn(),
+                                    input=json.dumps(execution_input))
+
+    # Poll the Activity for the task token, then prompt the human (CLI input)
+    task_resp = sfn.get_activity_task(activityArn=_activity_arn(), workerName="cli-agent")
+    task_token = task_resp.get("taskToken")
+    ...
+    response = input("  Approve? [y/N]: ").strip().lower()
+    if response in ("y", "yes"):
+        sfn.send_task_success(taskToken=task_token, output=json.dumps({"approved": True}))
+        return _do_purchase(quote, user_id)        # pay via Wallet Service, then dispense
+    else:
+        sfn.send_task_failure(taskToken=task_token, error="UserRejected",
+                              cause="User declined the purchase")
+        audit_logger.info(json.dumps({"event": "purchase_rejected", ...}))
+        return {"success": False, "status": "rejected", "message": "Purchase declined by user."}
 ```
 
-**Observability proof of HITL**:
+On approval, `_do_purchase()` emits structured audit logs (`purchase_approved` → `purchase_completed`)
+including `user_id`, `product_id`, `price`, recipient address, and the payment proof / transaction hash.
 
-Query Tempo for compliance report:
-```traceql
-# All purchases must have prior quote in same trace
-{ span.tool.name = "execute_purchase" }
-| select(
-    span.hitl.gate_passed as gate_passed,
-    span.trace_id as trace_id
-  )
-| filter(gate_passed = false)  # Should be empty!
+**Observability of HITL**: because `execute_purchase` carries the `@sigil_tool_wrapper` decorator and
+runs under Strands' OpenInference spans, every attempt — approved, rejected, or guard-blocked — shows
+up as a tool execution in Sigil and as a `TOOL` span in Tempo. The structured audit logs (exported to
+Loki) provide the compliance record, correlated to the trace by `trace_id`:
+
+```logql
+# Every completed purchase, with who/what/when
+{service_name="get-me-a-coke-agent"} |= "purchase_completed" | json
+
+# Any rejections
+{service_name="get-me-a-coke-agent"} |= "purchase_rejected" | json
 ```
 
-If this query returns results, HITL was bypassed → investigate immediately.
-
-#### 4. Metrics and Logs
+#### 5. Metrics and Logs
 
 The project also exports metrics and structured logs:
 
@@ -1701,6 +1803,32 @@ logging.getLogger().addHandler(handler)
 ```
 
 This creates a **unified observability stack** in Grafana: traces, metrics, and logs all correlated by `trace_id`.
+
+<a id="coexistence-scenarios"></a>
+#### 6. Coexistence Scenarios
+
+`configure_telemetry()` is called unconditionally from `src/agent/cli.py` and degrades gracefully
+depending on which credentials are present. It detects OTLP either from explicit Grafana params /
+`AgentConfig`, or from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` + `OTEL_EXPORTER_OTLP_HEADERS` env
+vars; Sigil is detected from `config.sigil_configured`:
+
+| OTLP (Grafana) | Sigil | Behaviour |
+|:--:|:--:|---|
+| ✅ | ✅ | Full pipeline: OpenInference processor + OTLP export (traces/metrics/logs) **and** Sigil client + Strands hooks |
+| ✅ | ❌ | OpenInference + OTLP export only; no Sigil client created |
+| ❌ | ✅ | `TracerProvider`/`MeterProvider` set up **without** the OpenInference processor or OTLP exporter, so Sigil can emit its internal signals; Sigil client active |
+| ❌ | ❌ | Telemetry skipped entirely; a single warning is logged |
+
+Initialization order, as enforced in `cli.py` → `configure_telemetry()`:
+
+```python
+# src/agent/cli.py
+config = AgentConfig()
+configure_telemetry(config=config)   # 1. providers + processors + Sigil client — BEFORE the agent
+agent = create_agent(config)         # 2. agent picks up the global providers + Sigil hooks
+...
+shutdown_sigil()                     # 3. flush spans and the Sigil client on exit
+```
 
 ---
 
@@ -2151,7 +2279,8 @@ This document integrates insights from **74 technical sources** on LLM and AI ag
 
 ---
 
-**Document Version**: 2.0  
-**Last Updated**: 2026-05-26  
-**Authors**: Claude Sonnet 4.5 (AI Engineering Team, DNX)  
-**Research Sources**: 74 technical documents on AI observability, OpenInference, and Grafana integration
+**Document Version**: 2.1  
+**Last Updated**: 2026-06-15  
+**Authors**: AI Engineering Team, DNX  
+**Research Sources**: 74 technical documents on AI observability, OpenInference, and Grafana integration  
+**Note**: The "Real-World Example: Get Me a Coke" section is reconciled against the actual source in `src/observability/` and `src/agent/`. Earlier sections remain conceptual/illustrative.

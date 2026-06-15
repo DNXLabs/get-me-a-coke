@@ -127,7 +127,7 @@ SIGIL_USER_ID=<user>
 SIGIL_TAGS=project=get-me-a-coke,env=dev,team=dnx-ai
 ```
 
-> 📚 For the full background on AI observability, OpenInference span kinds, evaluation, and HITL patterns, see [`docs/observability-deep-dive.md`](docs/observability-deep-dive.md).
+> 📚 For the full background on AI observability, OpenInference span kinds, evaluation, and HITL patterns, see [`docs/observability-deep-dive.md`](docs/observability-deep-dive.md). Its "Real-World Example: Get Me a Coke" section is reconciled against the actual source in `src/observability/` and `src/agent/`.
 
 ## Configuration
 
