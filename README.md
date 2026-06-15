@@ -4,6 +4,11 @@ Proof-of-concept: autonomous agent-to-service commerce using the x402 payment pr
 
 An AI agent (Strands Agents SDK on AWS Bedrock) autonomously discovers, pays for, and receives products from a vending machine API (FastAPI + x402), behind a human-in-the-loop approval gate — fully instrumented for AI observability with **OpenInference + Grafana Sigil → Grafana Cloud**.
 
+## Demo & Resources
+
+- 🎬 **Demo video:** [`docs/assets/get-me-a-coke.mp4`](docs/assets/get-me-a-coke.mp4) — end-to-end run of the agent buying a coke through the HITL approval gate.
+- 📑 **Slide deck:** [`docs/assets/DNX-Grafana-AI-Observability-Get-me-a-coke.pdf`](docs/assets/DNX-Grafana-AI-Observability-Get-me-a-coke.pdf) — DNX × Grafana AI Observability walkthrough.
+
 ## Quick Start
 
 ```bash
